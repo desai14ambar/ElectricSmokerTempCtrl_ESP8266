@@ -1,0 +1,375 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
+
+#define SERIESRESISTOR 9970    
+#define THERMISTORPIN A0 
+#define DIGITALPIN D1
+#define RELAYPIN D2
+#define TEMPERATURENOMINAL 25 
+#define BCOEFFICIENT 3950
+#define THERMISTORNOMINAL 100000 
+
+const char *ssid = ""; 
+const char *password = ""; 
+
+ESP8266WebServer server(80);
+
+int samples[5];
+uint16_t desiredTemp = 0;  
+uint16_t currentTemp = 0;
+bool input = false;
+bool isValid = true;
+bool relayStatus = false;
+
+float calculateTemperature() {
+  uint8_t i;
+  float reading;
+  reading = 0;
+
+  for (i=0; i<5; i++) {
+    samples[i] = analogRead(THERMISTORPIN);
+    delay(10);
+    reading += samples[i];
+  }
+ 
+  reading /= 5;
+ 
+  // convert the value to resistance
+  reading = (1023 / reading) - 1;     // (1023/ADC - 1) 
+  reading = SERIESRESISTOR / reading;  // 10K / (1023/ADC - 1)
+
+  float steinhart, tempC, tempF;
+  steinhart = reading / THERMISTORNOMINAL;     // (R/Ro)
+  steinhart = log(steinhart);                  // ln(R/Ro)
+  steinhart /= BCOEFFICIENT;                   // 1/B * ln(R/Ro)
+  steinhart += 1.0 / (TEMPERATURENOMINAL + 273.15); // + (1/To)
+  steinhart = 1.0 / steinhart;                 // Invert
+ 
+  tempC = steinhart - 273.15;                  // convert Kelvin to C
+  tempF = (tempC * 9.0/5.0) + 32.0;                  // convert C to F
+
+  //Serial.print("Temp: "); 
+  //Serial.println(tempF);
+  tempF = 1.025 * tempF - 8.155;   // calibration linear equation; works well 170F-220F
+  return (uint16_t)roundf(tempF);
+}
+
+void mainPage() {
+  // Main page layout
+  String page = R"rawliteral(
+  <!DOCTYPE html>
+  <html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ECE 554 Project</title>
+    <script src="https://code.highcharts.com/highcharts.js"></script>
+    <style>
+      body {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        min-height: 100vh;
+        margin: 0;
+        font-family: Tahoma, sans-serif;
+        text-align: center;
+        background-image: url('https://static.vecteezy.com/system/resources/previews/004/968/002/non_2x/cute-abstract-modern-background-free-vector.jpg'); 
+        background-size: cover; 
+        background-position: center;
+        background-repeat: no-repeat;
+        color: #000000;
+      }
+      header {
+        position: absolute;
+        top: 10px;
+        width: 100%;
+        text-align: center;
+      }
+      h1 {
+        margin: 0;
+        font-size: 2rem;
+      } 
+      button {
+        font-size: 1.5rem;
+        border: none;
+        background: none;
+        cursor: pointer;
+      }
+      form {
+        margin: 10px 0;
+      }
+      .relay-light {
+        width: 20px;
+        height: 20px;
+        border-radius: 50%;
+        display: inline-block;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>ECE 554 Project</h1>
+    </header>
+  )rawliteral";
+  
+  // Add error message if input is invalid
+  if (isValid == false) {
+    page += "<h3 style=\"color: red;\">Invalid Input: Please type a value between 0 and 500.</h3>"; 
+  }
+
+  // Add input form
+  page += "<form action=\"/setTemp\" method=\"GET\">";
+  page += "<h3 style=\"display: inline; margin-right: 10px;\">Desired Temperature (&deg;F):</h3>";
+  page += "<input type=\"text\" name=\"temp\" style=\"display: inline; margin-right: 10px;\">";
+  page += "<input type=\"submit\" value=\"Set\" style=\"display: inline;\">";
+  page += "</form>";
+
+  // Display current and desired temperature values
+  page += "<h3 id=\"currentTemp\" style=\"margin-bottom: 5px;\">Current Temperature: <span id='ctempValue'></span></h3>";
+
+  if (input == false) {
+    page += "<h3 style=\"margin-top: 0; margin-bottom: 5px;\">Desired Temperature: N/A. Please enter a temperature value.</h3>";
+  } 
+  else {
+    page += "<h3 id=\"desiredTemp\" style=\"margin-top: 0; margin-bottom: 5px;\">Desired Temperature: <span id='dtempValue'></span></h3>";
+  }
+  
+  // Relay Status Light
+  page += R"rawliteral(
+  <div id="relay-color" class="relay-light"></div>
+  <span id="relay-text" style="font-weight: bold;"></span>
+
+  <script>
+    function updateRelayStatus() {
+      fetch('/getRelayStatus') 
+        .then(response => response.text()) 
+        .then(status => {
+          var relayStatus = (status === 'true'); // check true or false
+
+          // Get the color and text
+          var relayLight = document.getElementById('relay-color');
+          var statusText = document.getElementById('relay-text');
+
+          if (relayStatus) {
+            relayLight.style.backgroundColor = 'red'; 
+            statusText.innerText = 'Relay ON';
+          } 
+          else {
+            relayLight.style.backgroundColor = 'grey'; 
+            statusText.innerText = 'Relay OFF';
+          }
+        });
+    }
+
+    setInterval(updateRelayStatus, 3000); // 3 seconds
+  </script>
+  )rawliteral";
+  page += "<hr style=\"border: 0; border-top: 1px solid transparent; width: 80%; margin-top: 20px; margin-bottom: 20px;\">";
+  
+  // Plot
+  page += R"rawliteral(
+  <div id="chart-temperature" class="container" style="width: 80%; height: 400px;"></div>
+
+  <script>
+    // Initialize Highcharts
+    var chartT = Highcharts.chart('chart-temperature', {
+      chart: { type: 'line' },
+      title: { text: 'Temperature Readings' },
+      xAxis: {
+        title: { text: 'Time (EST)' },
+        type: 'datetime',
+        dateTimeLabelFormats: {
+          second: '%I:%M:%S' 
+        },
+        labels: {
+          formatter: function () {
+            let estOffset = 18000000; 
+            let localTime = this.value - estOffset; // Convert to EST
+            return Highcharts.dateFormat('%I:%M:%S', localTime); 
+          }
+        }
+      },
+      yAxis: { title: { text: 'Temperature (°F)' },
+              min: 50,  // Set the minimum value of the y-axis
+              max: 300  // Set the maximum value of the y-axis 
+      },
+      series: [
+        { 
+          name: 'Current Temperature', 
+          data: [], 
+          color: '#FF5733', 
+          marker: { enabled: true, radius: 4, symbol: 'circle' } 
+        },
+        { 
+          name: 'Desired Temperature', 
+          data: [], 
+          color: '#337BFF', 
+          dataLabels: { enabled: false },
+          marker: { enabled: false } 
+        }
+      ],
+      plotOptions: {
+        series: {
+          dataLabels: {
+            enabled: true,
+            style: {
+              color: '#000000', 
+              fontSize: '12px', 
+              fontWeight: 'bold', 
+            }
+          }
+        }
+      },
+      tooltip: {
+        formatter: function () {
+          let estOffset = 18000000;
+          let localTime = this.x - estOffset; 
+            
+          // Return the tooltip content
+          return 'Time: ' + Highcharts.dateFormat('%I:%M:%S %p', localTime) + '<br>' + 'Temperature: ' + this.y + '°F';
+        }
+      },
+    });
+  </script>
+  )rawliteral";
+
+  // Function to update desired temperature graph (if valid)
+  if (input) {
+    page += R"rawliteral(
+    <script>
+      function graphDesiredTemperature() {
+        fetch('/getDesiredTemp')
+          .then(response => response.text())
+          .then(dtemp => {
+            // Update the desired temperature on the webpage
+            document.getElementById('desiredTemp').innerHTML = "Desired Temperature: " + dtemp + "&deg;F";
+            
+            var yDesired = parseFloat(dtemp);
+            var xDesired = new Date().getTime();
+            chartT.series[1].addPoint([xDesired, yDesired], true, chartT.series[1].data.length > 9);
+          })
+      }
+
+      setInterval(graphDesiredTemperature, 3000);
+    </script>
+    )rawliteral";
+  }
+
+  // Function to update current temperature value and graph
+  page += R"rawliteral(
+  <script>
+    function graphCurrentTemperature() {
+      fetch('/getTemp')
+        .then(response => response.text())
+        .then(ctemp => {
+          // Update the current temperature on the webpage
+          document.getElementById('currentTemp').innerHTML = "Current Temperature: " + ctemp + "&deg;F";
+
+          // Add data point to Highcharts graph
+          var xCurrent = new Date().getTime();   
+          var yCurrent = parseFloat(ctemp);      
+          chartT.series[0].addPoint([xCurrent, yCurrent], true, chartT.series[0].data.length > 9);
+        })
+    }
+
+    setInterval(graphCurrentTemperature, 3000); // 3 seconds
+  </script>
+  )rawliteral";
+    
+  page += "</body>";
+  page += "</html>";
+  
+  server.send(200, "text/html", page); 
+}
+
+// Form input for desired temperature
+void storeTemp() {
+  if (server.hasArg("temp")) {
+    String tempInput = server.arg("temp");  // Get user input as a String
+
+    // Check if the input is a valid number and falls within the 0-500 range
+    float tempValue = tempInput.toFloat();
+    if (tempValue >= 0 && tempValue <= 500) {
+      desiredTemp = (uint16_t)roundf(tempValue);  // Save the valid input as desiredTemp 
+      input = true;
+      isValid = true;
+    }
+    else {
+      isValid = false;
+    }
+  }
+
+  server.sendHeader("Location", "/"); // Redirect to the main page
+  server.send(303); 
+}
+
+void getTemperature() {
+  server.send(200, "text/plain", String(currentTemp));
+}
+
+void getDesiredTemperature() {
+  server.send(200, "text/plain", String(desiredTemp));
+}
+
+void getRelayStatus() {
+  server.send(200, "text/plain", relayStatus ? "true" : "false");
+}
+
+void setRelayStatus() {
+  uint16_t hysteresis = 5; // 5 degrees threshold
+  if (currentTemp < (desiredTemp - hysteresis)) { 
+    relayStatus = true;
+    digitalWrite(RELAYPIN, HIGH); 
+  }
+  else if (currentTemp > (desiredTemp + hysteresis)) { 
+    relayStatus = false; 
+    digitalWrite(RELAYPIN, LOW);
+  }
+  //Serial.println(relayStatus);
+}
+
+void setup(void) {
+  // Keep thermistor digital pin (D1) high
+  pinMode(DIGITALPIN, OUTPUT); 
+  digitalWrite(DIGITALPIN, HIGH);  
+
+  pinMode(RELAYPIN, OUTPUT); 
+  digitalWrite(RELAYPIN, LOW);  
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  Serial.begin(9600); // baud rate
+  // Wait until wifi is connected
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+  }
+  Serial.println("Connected to WiFi");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  if (MDNS.begin("esp8266")) {              // Start the mDNS responder for esp8266.local
+    Serial.println("mDNS responder started");
+  } else {
+    Serial.println("Error setting up MDNS responder!");
+  }
+
+  // Set up server routes
+  server.on("/", mainPage);
+  server.on("/setTemp", storeTemp);
+  server.on("/getTemp", getTemperature);
+  server.on("/getDesiredTemp", getDesiredTemperature);
+  server.on("/getRelayStatus", getRelayStatus);
+
+  server.begin();
+  Serial.println("Webpage is running.");
+}
+ 
+void loop(void) {
+  MDNS.update();
+  server.handleClient();
+  currentTemp = calculateTemperature();
+  setRelayStatus();
+  // delay(1000);
+}
